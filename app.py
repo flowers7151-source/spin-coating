@@ -303,7 +303,7 @@ def draw_final_profile(r_array, final_profile):
     return fig
 
 
-def draw_time_resolved_profile(r_array, profile, selected_time, uniformity):
+def draw_time_resolved_profile(r_array, profile, selected_time, uniformity, y_limit_um):
     fig, ax = plt.subplots()
     ax.plot(
         r_array * 1000,
@@ -314,6 +314,8 @@ def draw_time_resolved_profile(r_array, profile, selected_time, uniformity):
     ax.set_xlabel("Radial position r [mm]")
     ax.set_ylabel("Thickness h(r,t) [um]")
     ax.set_title("Time-Resolved Radial Thickness Profile")
+    ax.set_xlim(r_array[0] * 1000, r_array[-1] * 1000)
+    ax.set_ylim(0.0, y_limit_um)
     ax.legend()
     fig.tight_layout()
     return fig
@@ -394,6 +396,7 @@ with tab_sim:
     selected_index = int(np.argmin(np.abs(time_radial - selected_time)))
     selected_profile = h_radial[:, selected_index]
     selected_uniformity, selected_h_max, selected_h_min, selected_h_mean = compute_uniformity(selected_profile)
+    radial_y_limit_um = float(np.max(h_radial) * 1e6 * 1.05)
 
     selected_cols = st.columns(4)
     selected_cols[0].metric("Selected time", f"{time_radial[selected_index]:.1f} s")
@@ -407,6 +410,7 @@ with tab_sim:
             selected_profile,
             time_radial[selected_index],
             selected_uniformity,
+            radial_y_limit_um,
         )
     )
 
