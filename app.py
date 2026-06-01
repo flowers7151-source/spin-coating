@@ -303,6 +303,22 @@ def draw_final_profile(r_array, final_profile):
     return fig
 
 
+def draw_time_resolved_profile(r_array, profile, selected_time, uniformity):
+    fig, ax = plt.subplots()
+    ax.plot(
+        r_array * 1000,
+        profile * 1e6,
+        color="teal",
+        label=f"t = {selected_time:.1f} s, U = {uniformity:.2f}%",
+    )
+    ax.set_xlabel("Radial position r [mm]")
+    ax.set_ylabel("Thickness h(r,t) [um]")
+    ax.set_title("Time-Resolved Radial Thickness Profile")
+    ax.legend()
+    fig.tight_layout()
+    return fig
+
+
 st.title("Spin Coating Thin-Film Simulator")
 st.caption("Emslie-Bonner-Peck thinning with Meyerhofer-type evaporation and viscosity growth")
 
@@ -366,6 +382,33 @@ with tab_sim:
     with right:
         st.pyplot(draw_viscosity_plot(time_evap, eta0, alpha))
         st.pyplot(draw_final_profile(r_array, final_profile))
+
+    st.subheader("Time-Resolved Radial Profile")
+    selected_time = st.slider(
+        "Select time for radial profile [s]",
+        min_value=0.0,
+        max_value=float(t_end),
+        value=float(t_end),
+        step=max(float(t_end) / 120.0, 0.1),
+    )
+    selected_index = int(np.argmin(np.abs(time_radial - selected_time)))
+    selected_profile = h_radial[:, selected_index]
+    selected_uniformity, selected_h_max, selected_h_min, selected_h_mean = compute_uniformity(selected_profile)
+
+    selected_cols = st.columns(4)
+    selected_cols[0].metric("Selected time", f"{time_radial[selected_index]:.1f} s")
+    selected_cols[1].metric("Mean thickness", f"{selected_h_mean * 1e6:.2f} um")
+    selected_cols[2].metric("Uniformity U", f"{selected_uniformity:.2f}%")
+    selected_cols[3].metric("Thickness range", f"{selected_h_min * 1e6:.2f}-{selected_h_max * 1e6:.2f} um")
+
+    st.pyplot(
+        draw_time_resolved_profile(
+            r_array,
+            selected_profile,
+            time_radial[selected_index],
+            selected_uniformity,
+        )
+    )
 
     st.write(
         f"Final thickness range: {h_min * 1e6:.2f} to {h_max * 1e6:.2f} um; "
