@@ -31,6 +31,12 @@ def rpm_to_rad_per_s(rpm: float) -> float:
     return rpm * 2.0 * np.pi / 60.0
 
 
+def effective_evaporation_rate_um_s(rpm: float, evaporation_mode: str, evaporation_direct_um_s: float, evaporation_ref_um_s: float):
+    if evaporation_mode.startswith("Rotation-dependent"):
+        return evaporation_ref_um_s * np.sqrt(rpm / 3000.0)
+    return evaporation_direct_um_s
+
+
 def viscosity_model(t, eta0: float, alpha: float):
     # eta(t) = eta0 exp(alpha t)
     return eta0 * np.exp(alpha * t)
@@ -76,12 +82,57 @@ def gaussian_initial_profile(r, wafer_radius: float, base_thickness: float, pert
     return base_thickness + perturbation_amplitude * np.exp(-beta * (r / wafer_radius) ** 2)
 
 
+def make_initial_profile(
+    profile_type: str,
+    r,
+    wafer_radius: float,
+    base_thickness: float,
+    perturbation_amplitude: float,
+    beta: float,
+):
+    if profile_type == "Uniform":
+        return np.full_like(r, base_thickness)
+    return gaussian_initial_profile(r, wafer_radius, base_thickness, perturbation_amplitude, beta)
+
+
 def compute_uniformity(thickness_profile):
     h_max = np.max(thickness_profile)
     h_min = np.min(thickness_profile)
     h_mean = np.mean(thickness_profile)
     uniformity_percent = (h_max - h_min) / h_mean * 100.0
     return uniformity_percent, h_max, h_min, h_mean
+
+
+def compute_dimensionless_numbers(
+    rpm: float,
+    rho: float,
+    eta0: float,
+    characteristic_thickness_um: float,
+    wafer_radius_mm: float,
+    surface_tension: float,
+    mean_free_path_nm: float,
+    mass_diffusivity: float,
+):
+    omega = rpm_to_rad_per_s(rpm)
+    h0 = characteristic_thickness_um * 1e-6
+    radius = wafer_radius_mm * 1e-3
+    epsilon = h0 / radius
+    k0 = ebp_parameter(rho, omega, eta0)
+    characteristic_velocity = k0 * radius * h0**2
+    reynolds = rho * characteristic_velocity * h0 / eta0
+    reduced_reynolds = reynolds * epsilon**2
+    capillary = eta0 * characteristic_velocity / surface_tension
+    knudsen = mean_free_path_nm * 1e-9 / h0
+    schmidt = eta0 / (rho * mass_diffusivity)
+    return {
+        "epsilon": epsilon,
+        "velocity": characteristic_velocity,
+        "reynolds": reynolds,
+        "reduced_reynolds": reduced_reynolds,
+        "capillary": capillary,
+        "knudsen": knudsen,
+        "schmidt": schmidt,
+    }
 
 
 @st.cache_data(show_spinner=False)
@@ -125,6 +176,70 @@ def solve_uniform_model(
 
 
 @st.cache_data(show_spinner=False)
+def solve_layer_gelation_model(
+    rpm: float,
+    rho: float,
+    eta0: float,
+    alpha: float,
+    h0_um: float,
+    evaporation_um_s: float,
+    initial_solid_fraction: float,
+    gel_solid_fraction: float,
+    t_end: float,
+    num_time_points: int,
+):
+    omega = rpm_to_rad_per_s(rpm)
+    h0 = h0_um * 1e-6
+    evaporation_rate = evaporation_um_s * 1e-6
+    solid_initial = initial_solid_fraction * h0
+    liquid_initial = (1.0 - initial_solid_fraction) * h0
+    t_eval = np.linspace(0.0, t_end, num_time_points)
+
+    def layer_rhs(t, y):
+        solid_height = max(y[0], 0.0)
+        liquid_height = max(y[1], 0.0)
+        total_height = solid_height + liquid_height
+        if total_height <= 0.0:
+            return [0.0, 0.0]
+
+        eta_t = viscosity_model(t, eta0, alpha)
+        k_t = ebp_parameter(rho, omega, eta_t)
+        flow_thinning_rate = 2.0 * k_t * total_height**3
+        solid_fraction = solid_height / total_height
+        liquid_fraction = liquid_height / total_height
+
+        dsolid_dt = -solid_fraction * flow_thinning_rate
+        dliquid_dt = -liquid_fraction * flow_thinning_rate - evaporation_rate
+
+        if liquid_height <= 0.0:
+            dliquid_dt = max(dliquid_dt, 0.0)
+        return [dsolid_dt, dliquid_dt]
+
+    solution = solve_ivp(
+        fun=layer_rhs,
+        t_span=(0.0, t_end),
+        y0=[solid_initial, liquid_initial],
+        t_eval=t_eval,
+        method="RK45",
+        rtol=1e-8,
+        atol=1e-12,
+    )
+
+    solid = np.maximum(solution.y[0], 0.0)
+    liquid = np.maximum(solution.y[1], 0.0)
+    total = solid + liquid
+    concentration = np.divide(solid, total, out=np.ones_like(solid), where=total > 0.0)
+
+    gel_indices = np.where(concentration >= gel_solid_fraction)[0]
+    if len(gel_indices) == 0:
+        gel_time = None
+    else:
+        gel_time = float(solution.t[gel_indices[0]])
+
+    return solution.t, solid, liquid, concentration, gel_time
+
+
+@st.cache_data(show_spinner=False)
 def radial_solver(
     rpm: float,
     rho: float,
@@ -135,6 +250,8 @@ def radial_solver(
     base_thickness_um: float,
     perturbation_um: float,
     beta: float,
+    profile_type: str,
+    fdm_scheme: str,
     t_end: float,
     num_radial_nodes: int,
     num_time_points: int,
@@ -144,7 +261,8 @@ def radial_solver(
     wafer_radius = wafer_radius_mm * 1e-3
     r_array = np.linspace(0.0, wafer_radius, num_radial_nodes)
     t_eval = np.linspace(0.0, t_end, num_time_points)
-    h_initial = gaussian_initial_profile(
+    h_initial = make_initial_profile(
+        profile_type,
         r_array,
         wafer_radius,
         base_thickness_um * 1e-6,
@@ -163,8 +281,11 @@ def radial_solver(
 
         dflux_dr = np.zeros_like(h)
         dflux_dr[0] = (flux_like[1] - flux_like[0]) / dr
-        dflux_dr[1:-1] = (flux_like[2:] - flux_like[:-2]) / (2.0 * dr)
-        dflux_dr[-1] = (flux_like[-1] - flux_like[-2]) / dr
+        if fdm_scheme.startswith("Outward"):
+            dflux_dr[1:] = (flux_like[1:] - flux_like[:-1]) / dr
+        else:
+            dflux_dr[1:-1] = (flux_like[2:] - flux_like[:-2]) / (2.0 * dr)
+            dflux_dr[-1] = (flux_like[-1] - flux_like[-2]) / dr
 
         dhdt = -(1.0 / r_safe) * dflux_dr - evaporation_rate
         return np.where(h <= 0.0, np.maximum(dhdt, 0.0), dhdt)
@@ -216,11 +337,15 @@ def parameter_sweep(
     n_eta: int,
     rho: float,
     alpha: float,
-    evaporation_um_s: float,
     wafer_radius_mm: float,
     base_thickness_um: float,
     perturbation_um: float,
     beta: float,
+    profile_type: str,
+    fdm_scheme: str,
+    evaporation_mode: str,
+    evaporation_direct_um_s: float,
+    evaporation_ref_um_s: float,
     t_end: float,
 ):
     rpm_values = np.linspace(rpm_min, rpm_max, n_rpm)
@@ -229,16 +354,24 @@ def parameter_sweep(
 
     for i, eta0_i in enumerate(eta0_values):
         for j, rpm_j in enumerate(rpm_values):
+            effective_evaporation = effective_evaporation_rate_um_s(
+                rpm_j,
+                evaporation_mode,
+                evaporation_direct_um_s,
+                evaporation_ref_um_s,
+            )
             r_array, _, _, h_radial = radial_solver(
                 rpm=rpm_j,
                 rho=rho,
                 eta0=eta0_i,
                 alpha=alpha,
-                evaporation_um_s=evaporation_um_s,
+                evaporation_um_s=effective_evaporation,
                 wafer_radius_mm=wafer_radius_mm,
                 base_thickness_um=base_thickness_um,
                 perturbation_um=perturbation_um,
                 beta=beta,
+                profile_type=profile_type,
+                fdm_scheme=fdm_scheme,
                 t_end=t_end,
                 num_radial_nodes=70,
                 num_time_points=120,
@@ -321,6 +454,19 @@ def draw_time_resolved_profile(r_array, profile, selected_time, uniformity, y_li
     return fig
 
 
+def draw_concentration_plot(time_array, concentration, gel_solid_fraction):
+    fig, ax = plt.subplots()
+    ax.plot(time_array, concentration, color="purple", label="Solid fraction C(t)")
+    ax.axhline(gel_solid_fraction, color="black", linestyle="--", label="Gel threshold")
+    ax.set_xlabel("Time [s]")
+    ax.set_ylabel("Solid fraction C(t) [-]")
+    ax.set_title("Gelation Estimate from S + L Layer Model")
+    ax.set_ylim(0.0, 1.05)
+    ax.legend()
+    fig.tight_layout()
+    return fig
+
+
 st.title("Spin Coating Thin-Film Simulator")
 st.caption("Emslie-Bonner-Peck thinning with Meyerhofer-type evaporation and viscosity growth")
 
@@ -331,18 +477,40 @@ with st.sidebar:
     h0_um = st.slider("Uniform initial thickness [um]", 20.0, 200.0, 100.0, 5.0)
     rho = st.slider("Density rho [kg/m3]", 700.0, 1400.0, 1000.0, 25.0)
     alpha = st.slider("Viscosity growth alpha [1/s]", 0.0, 0.10, 0.05, 0.005)
-    evaporation_um_s = st.slider("Evaporation rate E [um/s]", 0.0, 0.20, 0.03, 0.005)
+    evaporation_mode = st.selectbox(
+        "Evaporation model",
+        ["Direct constant E", "Rotation-dependent E = E_ref sqrt(rpm/3000)"],
+    )
+    evaporation_direct_um_s = st.slider("Direct evaporation rate E [um/s]", 0.0, 0.20, 0.03, 0.005)
+    evaporation_ref_um_s = st.slider("E_ref at 3000 rpm [um/s]", 0.0, 0.20, 0.03, 0.005)
     t_end = st.slider("Simulation time [s]", 10.0, 120.0, 60.0, 5.0)
 
     st.header("Radial Inputs")
+    profile_type = st.selectbox("Initial radial profile", ["Gaussian", "Uniform"])
     wafer_radius_mm = st.slider("Wafer radius [mm]", 25.0, 100.0, 50.0, 5.0)
     base_thickness_um = st.slider("Radial base thickness [um]", 20.0, 150.0, 80.0, 5.0)
     perturbation_um = st.slider("Gaussian perturbation A [um]", 0.0, 100.0, 40.0, 5.0)
     beta = st.slider("Gaussian sharpness beta [-]", 1.0, 15.0, 6.0, 0.5)
+    fdm_scheme = st.selectbox("FDM scheme", ["Central difference", "Outward upwind/backward difference"])
     num_radial_nodes = st.slider("Radial nodes", 40, 180, 100, 10)
+
+    st.header("Gelation Estimate")
+    initial_solid_fraction = st.slider("Initial solid fraction C0 [-]", 0.05, 0.50, 0.15, 0.01)
+    gel_solid_fraction = st.slider("Gel solid fraction C_gel [-]", 0.50, 0.999, 0.80, 0.01)
+
+    st.header("Dimensionless Inputs")
+    surface_tension = st.slider("Surface tension gamma [N/m]", 0.010, 0.080, 0.030, 0.005)
+    mean_free_path_nm = st.slider("Mean free path lambda [nm]", 0.1, 10.0, 1.0, 0.1)
+    mass_diffusivity = st.number_input("Mass diffusivity D [m2/s]", value=1.0e-10, format="%.1e")
 
 
 omega = rpm_to_rad_per_s(rpm)
+evaporation_um_s = effective_evaporation_rate_um_s(
+    rpm,
+    evaporation_mode,
+    evaporation_direct_um_s,
+    evaporation_ref_um_s,
+)
 num_time_points = 320
 
 tab_sim, tab_validation, tab_map = st.tabs(["Core Simulator", "Validation", "Feasibility Map"])
@@ -350,6 +518,18 @@ tab_sim, tab_validation, tab_map = st.tabs(["Core Simulator", "Validation", "Fea
 with tab_sim:
     time_no_evap, h_no_evap, time_evap, h_evap, transition_time, flow_rate = solve_uniform_model(
         rpm, rho, eta0, alpha, h0_um, evaporation_um_s, t_end, num_time_points
+    )
+    gel_time_array, solid_height, liquid_height, concentration, gel_time = solve_layer_gelation_model(
+        rpm=rpm,
+        rho=rho,
+        eta0=eta0,
+        alpha=alpha,
+        h0_um=h0_um,
+        evaporation_um_s=evaporation_um_s,
+        initial_solid_fraction=initial_solid_fraction,
+        gel_solid_fraction=gel_solid_fraction,
+        t_end=t_end,
+        num_time_points=num_time_points,
     )
     r_array, time_radial, h_initial, h_radial = radial_solver(
         rpm=rpm,
@@ -361,6 +541,8 @@ with tab_sim:
         base_thickness_um=base_thickness_um,
         perturbation_um=perturbation_um,
         beta=beta,
+        profile_type=profile_type,
+        fdm_scheme=fdm_scheme,
         t_end=t_end,
         num_radial_nodes=num_radial_nodes,
         num_time_points=240,
@@ -370,12 +552,13 @@ with tab_sim:
     uniformity, h_max, h_min, h_mean = compute_uniformity(final_profile)
     spec = 2.0
 
-    cols = st.columns(5)
+    cols = st.columns(6)
     cols[0].metric("Angular velocity", f"{omega:.1f} rad/s")
-    cols[1].metric("Final mean thickness", f"{h_mean * 1e6:.2f} um")
-    cols[2].metric("Uniformity U", f"{uniformity:.2f}%")
-    cols[3].metric("Spec", "PASS" if uniformity <= spec else "FAIL")
-    cols[4].metric("Transition", "None" if transition_time is None else f"{transition_time:.1f} s")
+    cols[1].metric("Effective E", f"{evaporation_um_s:.3f} um/s")
+    cols[2].metric("Final mean thickness", f"{h_mean * 1e6:.2f} um")
+    cols[3].metric("Uniformity U", f"{uniformity:.2f}%")
+    cols[4].metric("Spec", "PASS" if uniformity <= spec else "FAIL")
+    cols[5].metric("t_gel", "None" if gel_time is None else f"{gel_time:.1f} s")
 
     left, right = st.columns(2)
     with left:
@@ -384,6 +567,32 @@ with tab_sim:
     with right:
         st.pyplot(draw_viscosity_plot(time_evap, eta0, alpha))
         st.pyplot(draw_final_profile(r_array, final_profile))
+        st.pyplot(draw_concentration_plot(gel_time_array, concentration, gel_solid_fraction))
+
+    with st.expander("Dimensionless numbers and model assumptions", expanded=False):
+        dimensionless = compute_dimensionless_numbers(
+            rpm=rpm,
+            rho=rho,
+            eta0=eta0,
+            characteristic_thickness_um=base_thickness_um,
+            wafer_radius_mm=wafer_radius_mm,
+            surface_tension=surface_tension,
+            mean_free_path_nm=mean_free_path_nm,
+            mass_diffusivity=mass_diffusivity,
+        )
+        dcols = st.columns(6)
+        dcols[0].metric("epsilon = H/R", f"{dimensionless['epsilon']:.2e}")
+        dcols[1].metric("U0", f"{dimensionless['velocity']:.2e} m/s")
+        dcols[2].metric("Re", f"{dimensionless['reynolds']:.2e}")
+        dcols[3].metric("Re*", f"{dimensionless['reduced_reynolds']:.2e}")
+        dcols[4].metric("Ca", f"{dimensionless['capillary']:.2e}")
+        dcols[5].metric("Kn", f"{dimensionless['knudsen']:.2e}")
+        st.metric("Sc", f"{dimensionless['schmidt']:.2e}")
+        st.write(
+            "epsilon supports the thin-film approximation; Re* is used as the reduced inertia check; "
+            "Ca is a bulk capillary indicator; Kn supports the continuum/no-slip assumption; "
+            "Sc indicates the relative time scales of momentum and mass diffusion."
+        )
 
     st.subheader("Time-Resolved Radial Profile")
     selected_time = st.slider(
@@ -416,7 +625,8 @@ with tab_sim:
 
     st.write(
         f"Final thickness range: {h_min * 1e6:.2f} to {h_max * 1e6:.2f} um; "
-        f"mean = {h_mean * 1e6:.2f} um."
+        f"mean = {h_mean * 1e6:.2f} um. "
+        f"Flow-to-evaporation transition = {'not detected' if transition_time is None else f'{transition_time:.2f} s'}."
     )
 
 with tab_validation:
@@ -469,11 +679,15 @@ with tab_map:
             n_eta=n_eta,
             rho=rho,
             alpha=alpha,
-            evaporation_um_s=evaporation_um_s,
             wafer_radius_mm=wafer_radius_mm,
             base_thickness_um=base_thickness_um,
             perturbation_um=perturbation_um,
             beta=beta,
+            profile_type=profile_type,
+            fdm_scheme=fdm_scheme,
+            evaporation_mode=evaporation_mode,
+            evaporation_direct_um_s=evaporation_direct_um_s,
+            evaporation_ref_um_s=evaporation_ref_um_s,
             t_end=t_end,
         )
 
